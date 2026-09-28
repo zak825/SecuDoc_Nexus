@@ -1,7 +1,6 @@
-import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 
 from app.core.config import settings
 from app.schemas.document import (
@@ -9,6 +8,11 @@ from app.schemas.document import (
     DocumentProcessResponse,
     DocumentStatus,
     evaluate_needs_review,
+)
+from app.services.pipeline_service import (
+    DocumentPipelineService,
+    build_destination_path,
+    get_pipeline_service,
 )
 
 router = APIRouter()
@@ -53,8 +57,11 @@ def _get_document_or_404(document_id: str) -> DocumentProcessResponse:
 
 
 @router.post("/upload", response_model=DocumentProcessResponse)
-async def upload_document(file: UploadFile) -> DocumentProcessResponse:
-    """PDFまたは画像を受け取り、処理結果のモックを返す。"""
+async def upload_document(
+    file: UploadFile,
+    pipeline: DocumentPipelineService = Depends(get_pipeline_service),
+) -> DocumentProcessResponse:
+    """PDFまたは画像を受け取り、OCR → SLM → 検証 を実行して結果を返す。"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="ファイル名がありません。")
     if not _is_allowed_document(file):
@@ -68,33 +75,7 @@ async def upload_document(file: UploadFile) -> DocumentProcessResponse:
         raise HTTPException(status_code=400, detail="空のファイルは受け付けません。")
 
     filename = Path(file.filename).name
-    confidence_score = 0.72
-    metadata = DocumentMetadata(
-        document_type="通知書",
-        issue_date="2026-04-01",
-        document_number=None,
-        sender="○○市役所",
-        recipient="△△課",
-        confidence_score=confidence_score,
-        needs_review=True,
-    )
-    metadata.needs_review = evaluate_needs_review(
-        metadata,
-        settings.CONFIDENCE_THRESHOLD,
-    )
-    status = (
-        DocumentStatus.NEEDS_REVIEW
-        if metadata.needs_review
-        else DocumentStatus.PENDING
-    )
-    response = DocumentProcessResponse(
-        document_id=str(uuid.uuid4()),
-        filename=filename,
-        status=status,
-        metadata=metadata,
-        destination_path=None,
-        error_message=None,
-    )
+    response = await pipeline.process_document(content, filename)
     _documents[response.document_id] = response
     return response
 
@@ -116,18 +97,15 @@ async def approve_document(
         metadata,
         settings.CONFIDENCE_THRESHOLD,
     )
-    destination = (
-        Path(settings.STORAGE_BASE_DIR)
-        / "approved"
-        / document_id
-        / Path(current.filename).name
-    )
+    # 人手で確定した内容は確定扱いなので、種別フォルダへの移動先を返す。
+    approved_metadata = metadata.model_copy(update={"needs_review": False})
+    destination = build_destination_path(approved_metadata, current.filename)
     approved = DocumentProcessResponse(
         document_id=document_id,
         filename=current.filename,
         status=DocumentStatus.APPROVED,
         metadata=metadata,
-        destination_path=destination.as_posix(),
+        destination_path=destination,
         error_message=None,
     )
     _documents[document_id] = approved
